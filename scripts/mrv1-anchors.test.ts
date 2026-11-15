@@ -3,7 +3,8 @@
 //   (2) the scoring engine: deterministic guards applied to MOCKED model output (the model is never called).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ANCHORS, FLAG_CRITERIA, PROSPECT_ANSWER_REQUIRED, anchorText, criteriaNeedingAnchors } from "../src/mrv1/anchors.ts";
+import { ANCHORS, PROSPECT_ANSWER_REQUIRED, anchorText, criteriaNeedingAnchors } from "../src/mrv1/anchors.ts";
+import { FLAG_CRITERIA } from "../src/mrv1/flag-caps.ts";
 import { ALL_CRITERIA, NA_REASONS_GENERAL, PASSES, criteriaForPass } from "../src/mrv1/rubric.ts";
 import { buildPassMessages } from "../src/mrv1/prompt.ts";
 import { runMrv1Evaluation } from "../src/mrv1/engine.ts";
@@ -156,7 +157,7 @@ test("engine: confirmed verified flags cap the criteria they overlap; ambiguous 
   assert.equal(crit(capped, "C07-02").outcome, "1");
   assert.equal(crit(capped, "C19-04").outcome, "1");
   assert.equal(crit(capped, "C11-02").outcome, "3"); // linked only to misleading_product_claim, which was not raised
-  assert.ok(capped.document.validation.adjustments.some((a: any) => /confirmed false_earnings_promise/.test(a.reason)));
+  assert.ok(capped.document.validation.adjustments.some((a: any) => /quote-verified false_earnings_promise/.test(a.reason)));
   // ambiguous reading: no cap, but the flag stays visible
   const amb = await run(fakeModel({ policy: pol, flags: [flag("false_earnings_promise", 3, "ambiguous")] }));
   assert.equal(crit(amb, "C15-03").outcome, "3");

@@ -9,13 +9,15 @@ import { parseModelJson } from "../evaluation/validate.ts";
 import { recordingCompleteness } from "../transcript-quality.ts";
 import { buildPassMessages } from "./prompt.ts";
 import { ALL_CRITERIA, MRV1_PROMPT_VERSION, MRV1_VERSION, PASSES, SALES_STAGE_CRITERIA, applicabilityFor, criteriaForPass } from "./rubric.ts";
-import type { Applicability } from "./rubric.ts";
+import type { Applicability, Pass } from "./rubric.ts";
 import { computePsychologyScore, computeSalesStageScore } from "./scoring.ts";
 import type { EvaluationState } from "./scoring.ts";
 import type { Extras, Mrv1Criterion, Mrv1Document, TranscriptAssessment } from "./types.ts";
 import { assessTranscript } from "./transcript-gate.ts";
 import type { TranscriptDecision } from "./transcript-gate.ts";
-import { applyFlagCaps, finalizeExtras, finalizePass, validatePass } from "./validate.ts";
+import { applyFlagCaps } from "./flag-caps.ts";
+import { finalizeExtras, finalizePass, validatePass } from "./validate.ts";
+import type { PassValue } from "./validate.ts";
 
 /** Recordings are 32 kbps constant-bitrate MP3 (verified in the transcription recovery work), so size gives duration. */
 export const RECORDING_BITRATE_BPS = 32000;
@@ -136,89 +138,135 @@ async function runPass(deps: Mrv1Deps, system: string, user: string, validate: (
   return { ok: false, result: last };
 }
 
-export async function runMrv1Evaluation(deps: Mrv1Deps, req: Mrv1Request): Promise<Mrv1Result> {
+/** Everything the passes and the assembly need. Produced by gates 1-3 without any model call; rebuilt identically by every queue stage. */
+export interface Mrv1Context {
+  call: Mrv1CallInfo;
+  label: ActiveCallTypeLabel;
+  callType: string;
+  labelledBy: string;
+  app: Exclude<Applicability, { kind: "hold" }>;
+  source: string;
+  transcript: LoadedTranscript;
+  quality: TranscriptQuality;
+  gateWarnings: string[];
+  promptVersion: string;
+  sha: string;
+  meta: Mrv1Document["metadata"];
+  naCats: string[];
+  expectedAll: string[];
+}
+export type PrepareResult = { ok: true; ctx: Mrv1Context } | { ok: false; result: Mrv1Result };
+
+/** Gates 1-3 and duplicate/revision handling. No model call. Used by the synchronous engine and by every queue stage. */
+export async function prepareMrv1(deps: Mrv1Deps, req: Mrv1Request): Promise<PrepareResult> {
   const now = deps.now ?? (() => new Date());
+  const stop = (result: Mrv1Result): PrepareResult => ({ ok: false, result });
   const call = await deps.store.loadCall(req.callyzerCallId);
-  if (!call) return failed(4, "call_not_found", "no call with that Callyzer id");
+  if (!call) return stop(failed(4, "call_not_found", "no call with that Callyzer id"));
 
   // Gate 1: recording.
   const rec = recordingGate(call);
-  if (!rec.ok) return { status: "hold", gate: 1, reason: rec.reason };
+  if (!rec.ok) return stop({ status: "hold", gate: 1, reason: rec.reason });
 
   // Gate 3 is checked before the transcript so an unconfirmed call is never prepared for evaluation (order of reporting only).
   const label = await deps.store.getActiveCallTypeLabel(call.id);
   const app = applicabilityFor(label?.business_call_type, Boolean(label && label.labelled_by.trim() !== ""));
-  if (app.kind === "hold") return { status: "hold", gate: 3, reason: app.reason };
+  if (app.kind === "hold") return stop({ status: "hold", gate: 3, reason: app.reason });
   const callType = label!.business_call_type;
   const labelledBy = label!.labelled_by.trim();
 
   // Gate 2: transcript.
   const source = req.transcriptSource ?? "production";
   const transcript = await deps.store.loadTranscript(call.id, source);
-  if (!transcript || transcript.segments.length === 0) return { status: "hold", gate: 2, reason: `no completed transcript with segments for source "${source}"` };
+  if (!transcript || transcript.segments.length === 0) return stop({ status: "hold", gate: 2, reason: `no completed transcript with segments for source "${source}"` });
   const quality = computeQuality(transcript.segments, call.duration_seconds, transcript.language);
   const tg = assessTranscript(transcript.segments, rec.audio_s, transcript.language);
   const gateWarnings: string[] = tg.reasons.filter((r) => r.severity === "note").map((r) => `transcript gate note ${r.code}: ${r.detail}`);
   if (tg.decision !== "eligible") {
     const codes = tg.reasons.filter((r) => r.severity !== "note").map((r) => r.code);
     if (!(tg.decision === "requires_human_review" && req.acknowledgeTranscriptReview))
-      return { status: "hold", gate: 2, decision: tg.decision, reason_codes: codes, reason: `transcript is not eligible (${tg.decision}): ${tg.reasons.filter((r) => r.severity !== "note").map((r) => r.detail).join("; ")}` };
+      return stop({ status: "hold", gate: 2, decision: tg.decision, reason_codes: codes, reason: `transcript is not eligible (${tg.decision}): ${tg.reasons.filter((r) => r.severity !== "note").map((r) => r.detail).join("; ")}` });
     gateWarnings.push(`transcript gate: human review acknowledged (${codes.join(", ")})`);
   }
 
   // Duplicate prevention: a free revision slot of (call, MRV1.0, prompt version). Invalidated evaluations are never replaced; a new revision is used.
   let promptVersion = MRV1_PROMPT_VERSION;
   for (let rev = 1; ; rev++) {
-    if (rev > MAX_REVISIONS) return failed(4, "too_many_revisions", "too many invalidated MRV1.0 revisions exist for this call");
+    if (rev > MAX_REVISIONS) return stop(failed(4, "too_many_revisions", "too many invalidated MRV1.0 revisions exist for this call"));
     promptVersion = rev === 1 ? MRV1_PROMPT_VERSION : `${MRV1_PROMPT_VERSION}#r${rev}`;
     const ex = await deps.store.findEvaluation(call.id, MRV1_VERSION, promptVersion);
     if (!ex) break;
-    if (!ex.invalidated) return { status: "exists", evaluation_id: ex.id, human_review_status: ex.human_review_status, evaluated_at: ex.evaluated_at };
+    if (!ex.invalidated) return stop({ status: "exists", evaluation_id: ex.id, human_review_status: ex.human_review_status, evaluated_at: ex.evaluated_at });
   }
-  if (req.dryRun) return { status: "ready", call_id: call.id, call_type: callType, applicability: app.kind, quality, passes: app.kind === "evaluate" ? PASSES.map((p) => p.key) : [] };
+  if (req.dryRun) return stop({ status: "ready", call_id: call.id, call_type: callType, applicability: app.kind, quality, passes: app.kind === "evaluate" ? PASSES.map((p) => p.key) : [] });
 
   const sha = await sha256Hex(formatTranscriptForPrompt(transcript.segments));
   const meta = { rubric_version: MRV1_VERSION, prompt_version: promptVersion, model_id: null as string | null, evaluated_at: now().toISOString(), call_id: call.id, callyzer_call_id: call.callyzer_call_id, agent_id: call.agent_id, transcript_source: source, transcript_sha256: sha, passes: [] as string[] };
-  const callTypeDoc = { label: callType, labelled_by: labelledBy, basis: label!.basis };
-
-  // Unsupported call type: no normal evaluation. Record the reason and require human review.
-  if (app.kind === "unsupported") {
-    const doc: Mrv1Document = {
-      metadata: meta, call_type: callTypeDoc, applicability: { status: "not_applicable", reason_code: "unsupported_call_type", na_categories: [] },
-      sales_stage: [], psychology: [], scores: { sales_stage: computeSalesStageScore({ state: "unsupported", criteria: [], expectedIds: [] }), psychology: computePsychologyScore([]) },
-      extras: null, transcript_assessment: null, transcript_quality: quality, validation: { warnings: [app.reason], adjustments: [] }, human_review: { status: "pending" },
-    };
-    try {
-      const id = await deps.store.saveEvaluation(doc, { rawModelOutputs: [], usage: [] });
-      return { status: "unsupported", evaluation_id: id, document: doc };
-    } catch (e) {
-      return failed(5, "persist_failed", e instanceof Error ? e.message.slice(0, 300) : "unknown");
-    }
-  }
-
-  // Gate 4 and 5: model passes, each validated; nothing is stored unless every pass is valid.
-  const naCats = app.na_categories;
+  const naCats = app.kind === "evaluate" ? app.na_categories : [];
   const expectedAll = ALL_CRITERIA.filter((c) => !naCats.includes(c.category_id)).map((c) => c.id);
-  const sales: Mrv1Criterion[] = [...naCriteria(naCats, app.na_reason ?? "call_type_not_covered", labelledBy)];
+  return { ok: true, ctx: { call, label: label!, callType, labelledBy, app, source, transcript, quality, gateWarnings, promptVersion, sha, meta, naCats, expectedAll } };
+}
+
+/** Unsupported call type: no normal evaluation. Record the reason and require human review. */
+export async function saveUnsupported(deps: Mrv1Deps, ctx: Mrv1Context): Promise<Mrv1Result> {
+  const reason = ctx.app.kind === "unsupported" ? ctx.app.reason : "unsupported call type";
+  const doc: Mrv1Document = {
+    metadata: ctx.meta, call_type: { label: ctx.callType, labelled_by: ctx.labelledBy, basis: ctx.label.basis }, applicability: { status: "not_applicable", reason_code: "unsupported_call_type", na_categories: [] },
+    sales_stage: [], psychology: [], scores: { sales_stage: computeSalesStageScore({ state: "unsupported", criteria: [], expectedIds: [] }), psychology: computePsychologyScore([]) },
+    extras: null, transcript_assessment: null, transcript_quality: ctx.quality, validation: { warnings: [reason], adjustments: [] }, human_review: { status: "pending" },
+  };
+  try {
+    const id = await deps.store.saveEvaluation(doc, { rawModelOutputs: [], usage: [] });
+    return { status: "unsupported", evaluation_id: id, document: doc };
+  } catch (e) {
+    return failed(5, "persist_failed", e instanceof Error ? e.message.slice(0, 300) : "unknown");
+  }
+}
+
+/** A validated model response for one pass (the unit stored by a queue stage). */
+export interface PassOutput {
+  pass_key: string;
+  expected_ids: string[];
+  value: PassValue;
+  raw: string;
+  usage: unknown;
+}
+export function expectedIdsFor(ctx: Mrv1Context, pass: Pass): string[] {
+  return criteriaForPass(pass).filter((c) => ctx.expectedAll.includes(c.id)).map((c) => c.id);
+}
+
+/** Gates 4 and 5 for ONE pass: one model call (with the in-pass retries), parsed and schema-validated. Stores nothing. */
+export async function executePass(deps: Mrv1Deps, ctx: Mrv1Context, pass: Pass): Promise<{ ok: true; output: PassOutput } | { ok: false; result: Mrv1Result }> {
+  const expectedIds = expectedIdsFor(ctx, pass);
+  const { system, user } = buildPassMessages({ pass, expectedIds, naCategories: ctx.naCats, callTypeLabel: ctx.callType, durationSeconds: ctx.call.duration_seconds, transcriptSource: ctx.source, segments: ctx.transcript.segments, quality: ctx.quality });
+  const out = await runPass(deps, system, user, (parsed) => validatePass(parsed, pass, expectedIds, ctx.transcript.segments.length), pass.key);
+  if (!out.ok) return out;
+  return { ok: true, output: { pass_key: pass.key, expected_ids: expectedIds, value: out.value as PassValue, raw: out.raw, usage: out.usage } };
+}
+
+/**
+ * Combine the validated outputs of every pass into one evaluation: evidence verification, caps, flag caps, scores, document, persistence.
+ * Used by the synchronous engine and by the queue's final stage. Deterministic: the same outputs always give the same document.
+ */
+export async function assembleMrv1(deps: Mrv1Deps, ctx: Mrv1Context, outputs: PassOutput[], req: Pick<Mrv1Request, "acknowledgeConflict">): Promise<Mrv1Result> {
+  const { transcript, naCats, callType, labelledBy } = ctx;
+  const sales: Mrv1Criterion[] = [...naCriteria(naCats, ctx.app.kind === "evaluate" ? ctx.app.na_reason ?? "call_type_not_covered" : "call_type_not_covered", labelledBy)];
   const psych: Mrv1Criterion[] = [];
   const adjustments: Adjustment[] = [];
-  const warnings: string[] = [...gateWarnings];
+  const warnings: string[] = [...ctx.gateWarnings];
   const raws: string[] = [];
   const usages: unknown[] = [];
   const assessments: TranscriptAssessment[] = [];
+  const passKeys: string[] = [];
   let extras: Extras | null = null;
   let openingObservable: "yes" | "no" | "unclear" = "yes";
   let conflict: TranscriptAssessment["call_type_conflict"] = null;
 
-  for (const pass of PASSES) {
-    const expectedIds = criteriaForPass(pass).filter((c) => expectedAll.includes(c.id)).map((c) => c.id);
-    if (expectedIds.length === 0) continue;
-    const { system, user } = buildPassMessages({ pass, expectedIds, naCategories: naCats, callTypeLabel: callType, durationSeconds: call.duration_seconds, transcriptSource: source, segments: transcript.segments, quality });
-    const out = await runPass(deps, system, user, (parsed) => validatePass(parsed, pass, expectedIds, transcript.segments.length), pass.key);
-    if (!out.ok) return out.result;
+  const ordered = PASSES.map((p) => ({ pass: p, out: outputs.find((o) => o.pass_key === p.key) })).filter((x): x is { pass: Pass; out: PassOutput } => x.out !== undefined);
+  for (const { pass, out } of ordered) {
     raws.push(out.raw);
     usages.push(out.usage);
-    meta.passes.push(pass.key);
+    passKeys.push(pass.key);
     const value = out.value;
     assessments.push(value.assessment);
     if (pass.key === PASSES[0].key) {
@@ -227,7 +275,7 @@ export async function runMrv1Evaluation(deps: Mrv1Deps, req: Mrv1Request): Promi
       if (cc && quoteInSegments(cc.quote, transcript.segments, cc.segment, cc.segment, 1)) conflict = cc;
       else if (cc) warnings.push("a call-type conflict was claimed but its quotation could not be verified; the claim was ignored");
     }
-    const fin = finalizePass(value, pass, expectedIds, transcript.segments, openingObservable);
+    const fin = finalizePass(value, pass, out.expected_ids, transcript.segments, openingObservable);
     adjustments.push(...fin.adjustments);
     warnings.push(...fin.warnings);
     for (const r of fin.results) (r.category_id === "SP" ? psych : sales).push(r);
@@ -238,7 +286,7 @@ export async function runMrv1Evaluation(deps: Mrv1Deps, req: Mrv1Request): Promi
       warnings.push(...fx.warnings);
     }
   }
-  // Confirmed ethical flags cap the criteria they overlap (flags come from the last pass, criteria from all passes).
+  // Confirmed, verified ethical flags cap the criteria they are justifiably linked to and overlap (see flag-caps.ts).
   if (extras) applyFlagCaps([...sales, ...psych], extras.flags, adjustments);
   // Final structural check: every expected criterion present exactly once.
   const got = new Set([...sales, ...psych].map((c) => c.criterion_id));
@@ -254,8 +302,8 @@ export async function runMrv1Evaluation(deps: Mrv1Deps, req: Mrv1Request): Promi
   const state: EvaluationState = worst ? "blocked" : "valid";
   const criteriaForScore = [...sales, ...psych].map((c) => ({ criterion_id: c.criterion_id, category_id: c.category_id, outcome: c.outcome }));
   const doc: Mrv1Document = {
-    metadata: { ...meta, model_id: deps.model.id },
-    call_type: callTypeDoc,
+    metadata: { ...ctx.meta, model_id: deps.model.id, passes: passKeys },
+    call_type: { label: callType, labelled_by: labelledBy, basis: ctx.label.basis },
     applicability: { status: "evaluated", reason_code: null, na_categories: naCats },
     sales_stage: sales,
     psychology: psych,
@@ -265,7 +313,7 @@ export async function runMrv1Evaluation(deps: Mrv1Deps, req: Mrv1Request): Promi
     },
     extras,
     transcript_assessment: assessments[0] ? { ...assessments[0], reliability: assessments.some((a) => a.reliability === "low") ? "low" : assessments.some((a) => a.reliability === "medium") ? "medium" : "high", call_type_conflict: conflict } : null,
-    transcript_quality: quality,
+    transcript_quality: ctx.quality,
     validation: { warnings, adjustments },
     human_review: { status: "pending" },
   };
@@ -280,9 +328,25 @@ export async function runMrv1Evaluation(deps: Mrv1Deps, req: Mrv1Request): Promi
   } catch (e) {
     const msg = e instanceof Error ? e.message : "unknown";
     if (/unique/i.test(msg)) {
-      const again = await deps.store.findEvaluation(call.id, MRV1_VERSION, promptVersion);
+      const again = await deps.store.findEvaluation(ctx.call.id, MRV1_VERSION, ctx.promptVersion);
       if (again) return { status: "exists", evaluation_id: again.id, human_review_status: again.human_review_status, evaluated_at: again.evaluated_at };
     }
     return failed(5, "persist_failed", msg.slice(0, 300));
   }
+}
+
+/** The synchronous engine: all four passes in one call. Kept for tests and controlled local use; the production path is the durable job pipeline (src/mrv1/jobs). */
+export async function runMrv1Evaluation(deps: Mrv1Deps, req: Mrv1Request): Promise<Mrv1Result> {
+  const p = await prepareMrv1(deps, req);
+  if (!p.ok) return p.result;
+  const ctx = p.ctx;
+  if (ctx.app.kind === "unsupported") return saveUnsupported(deps, ctx);
+  const outputs: PassOutput[] = [];
+  for (const pass of PASSES) {
+    if (expectedIdsFor(ctx, pass).length === 0) continue;
+    const o = await executePass(deps, ctx, pass);
+    if (!o.ok) return o.result;
+    outputs.push(o.output);
+  }
+  return assembleMrv1(deps, ctx, outputs, req);
 }

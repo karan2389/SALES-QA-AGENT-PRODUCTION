@@ -242,3 +242,27 @@ test("a recorded invalidation can still be made through the existing invalidate 
   assert.equal(x.ok, true);
   assert.equal(count(db, "SELECT COUNT(*) AS n FROM valid_evaluations"), 0);
 });
+
+test("flag-capped scores are stored with their audit trail, survive invalidation, and re-evaluation applies the rules again on a new revision", async () => {
+  const db = new DatabaseSync(":memory:");
+  migrate(db);
+  seed(db);
+  label(db, "new_webinar_prospect");
+  const flags = [{ flag_id: "false_earnings_promise", severity: "high", interpretation: "confirmed_conduct", segments: [3], quote: SEGMENTS[3].text, explanation: "Promised income." }];
+  const model = () => fakeModel({ flags, policy: (id) => (id === "C15-03" ? { outcome: "3", seg: 3 } : undefined) });
+  const first: any = await runMrv1Evaluation({ store: createMrv1Store(d1(db)), model: model() }, { callyzerCallId: "CY-7" });
+  assert.equal(first.status, "completed");
+  const row = db.prepare("SELECT outcome, score, model_original_outcome FROM evaluation_criteria WHERE criterion_id = 'C15-03'").get() as any;
+  assert.deepEqual({ ...row }, { outcome: "1", score: 1, model_original_outcome: "3" });
+  assert.equal((JSON.parse((db.prepare("SELECT validation_json FROM evaluations").get() as any).validation_json).adjustments as any[]).filter((a) => a.kind === "flag_cap").length, 3); // C14-02, C15-03 and C19-02 all cite the flagged segment and are linked to false_earnings_promise
+  assert.equal(count(db, "SELECT COUNT(*) AS n FROM evaluation_flags"), 1);
+  await invalidateEvaluation(d1(db), { evaluationId: first.evaluation_id, status: "invalidated", reason: "test", by: "me" } as any);
+  assert.equal(count(db, "SELECT COUNT(*) AS n FROM valid_evaluations"), 0);
+  assert.equal(count(db, "SELECT COUNT(*) AS n FROM evaluation_flags"), 1); // flags and criteria are kept for audit
+  assert.equal(count(db, "SELECT COUNT(*) AS n FROM evaluation_criteria WHERE model_original_outcome = '3'"), 1);
+  const again: any = await runMrv1Evaluation({ store: createMrv1Store(d1(db)), model: model() }, { callyzerCallId: "CY-7" });
+  assert.equal(again.document.metadata.prompt_version, "mrv1-prompt-v2#r2");
+  assert.equal(again.document.sales_stage.find((c: any) => c.criterion_id === "C15-03").outcome, "1");
+  assert.equal(count(db, "SELECT COUNT(*) AS n FROM valid_evaluations"), 1);
+  assert.equal(count(db, "SELECT COUNT(*) AS n FROM evaluation_flags"), 2);
+});

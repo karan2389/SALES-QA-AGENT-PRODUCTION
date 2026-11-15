@@ -31,6 +31,14 @@
     }
   ]
 
+  // MRV1.0 durable evaluation queue: NOT ENABLED. Queue resources are not created and migration 0007 is not applied.
+  // After you approve creating them (see docs/mrv1-durable-execution-design.md section 9), add, next to the bindings above:
+  //   "queues": {
+  //     "producers": [{ "binding": "EVAL_QUEUE", "queue": "mrv1-evaluation-jobs" }],
+  //     "consumers": [{ "queue": "mrv1-evaluation-jobs", "max_batch_size": 1, "max_batch_timeout": 1, "max_retries": 5, "dead_letter_queue": "mrv1-evaluation-jobs-dlq", "max_concurrency": 1 }]
+  //   }
+  // Do not uncomment before the queues exist: a deploy that references a missing queue fails.
+
   // Secrets (Callyzer token, Google service account, etc.) are NOT stored here.
   // Local: .dev.vars (gitignored). Deployed: `wrangler secret put <NAME>`.
 }

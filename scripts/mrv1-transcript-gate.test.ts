@@ -67,14 +67,22 @@ test("8 empty segments are ignored, but when they dominate there is insufficient
   assert.equal(r.decision, "insufficient_speech");
   assert.ok(codes(r).includes("empty_segments_dominate"));
 });
-test("9 broken encoding is corrupted; an isolated broken character is only a note", () => {
+test("9 broken encoding: heavy corruption is blocked; scattered stray characters in long segments go to a human; an isolated one is only a note", () => {
   const segs = english();
-  for (let i = 0; i < 8; i++) segs[i * 7].text += " ba�";
+  for (let i = 0; i < 8; i++) segs[i * 7].text += " ba\uFFFD\uFFFD\uFFFD\uFFFD"; // 32 broken characters, about 0.9% of the text
   const r = assessTranscript(segs, AUDIO, "en");
   assert.equal(r.decision, "corrupted_transcript");
   assert.ok(codes(r).includes("broken_encoding"));
+  // long segments (as Whisper produces for continuous Hindi speech): many segments tainted, but only a few characters broken
+  const scattered = english();
+  for (let i = 0; i < 12; i++) scattered[i * 5].text += " ba\uFFFD"; // 20% of segments, about 0.3% of the characters
+  const s = assessTranscript(scattered, AUDIO, "en");
+  assert.equal(s.decision, "requires_human_review");
+  assert.ok(codes(s).includes("broken_encoding_long_segments"));
+  assert.ok(!codes(s).includes("broken_encoding"));
+  assert.ok(Number(s.metrics.broken_char_ratio) < 0.005);
   const one = english();
-  one[10].text += " ba�";
+  one[10].text += " ba\uFFFD";
   const n = assessTranscript(one, AUDIO, "en");
   assert.equal(n.decision, "eligible");
   assert.ok(codes(n).includes("broken_encoding_minor"));

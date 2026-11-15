@@ -6,7 +6,7 @@ import type { CriterionDef } from "../evaluation/rubric.ts";
 import { quoteInSegments } from "../evaluation/transcript.ts";
 import type { Adjustment, EvidenceItem, ModelCriterion, Outcome, Segment } from "../evaluation/types.ts";
 import { validateFlags } from "./flags.ts";
-import { FLAG_CRITERIA, PROSPECT_ANSWER_REQUIRED } from "./anchors.ts";
+import { PROSPECT_ANSWER_REQUIRED } from "./anchors.ts";
 import { ELEMENT_RULE_DEFS, NA_REASONS_GENERAL, criteriaForPass } from "./rubric.ts";
 import type { Pass } from "./rubric.ts";
 import type { Confidence, Extras, Mrv1Criterion, ProfileField, TranscriptAssessment } from "./types.ts";
@@ -144,7 +144,7 @@ function validateExtras(raw: Record<string, any>, segCount: number, errors: stri
 const numericOutcome = (o: string) => o === "0" || o === "1" || o === "2" || o === "3";
 
 function asNE(c: Mrv1Criterion, reason: string, adjustments: Adjustment[], why: string): void {
-  adjustments.push({ criterion_id: c.criterion_id, from: c.outcome, to: "NE", reason: why });
+  adjustments.push({ criterion_id: c.criterion_id, from: c.outcome, to: "NE", reason: why, kind: "evidence" });
   c.model_original_outcome = c.model_original_outcome ?? c.outcome;
   c.outcome = "NE";
   c.score = null;
@@ -215,7 +215,7 @@ export function finalizePass(value: PassValue, pass: Pass, expectedIds: string[]
         else if (cap !== null && score > cap) {
           if (cap === 0) asNE(r, "inconsistent_model_output", adjustments, "reported elements allow no score above 0");
           else {
-            adjustments.push({ criterion_id: d.id, from: mc.outcome, to: String(cap) as Outcome, reason: "score capped to what the reported elements, counts or understanding check allow" });
+            adjustments.push({ criterion_id: d.id, from: mc.outcome, to: String(cap) as Outcome, reason: "score capped to what the reported elements, counts or understanding check allow", kind: "element_cap" });
             r.model_original_outcome = mc.outcome;
             r.outcome = String(cap) as Outcome;
             r.score = cap;
@@ -225,7 +225,7 @@ export function finalizePass(value: PassValue, pass: Pass, expectedIds: string[]
     }
     // Information the prospect must supply: a question alone (or a salesperson restatement) never earns 2 or 3.
     if (PROSPECT_ANSWER_REQUIRED.includes(d.id) && (r.outcome === "2" || r.outcome === "3") && !verified.some((e) => e.speaker === "prospect")) {
-      adjustments.push({ criterion_id: d.id, from: r.outcome, to: "1", reason: "a score of 2 or 3 needs a verified quotation attributed to the prospect: a question alone does not establish an answer" });
+      adjustments.push({ criterion_id: d.id, from: r.outcome, to: "1", reason: "a score of 2 or 3 needs a verified quotation attributed to the prospect: a question alone does not establish an answer", kind: "prospect_answer_cap" });
       r.model_original_outcome = r.model_original_outcome ?? r.outcome;
       r.outcome = "1";
       r.score = 1;
@@ -267,24 +267,3 @@ export function finalizeExtras(x: NonNullable<PassValue["extras"]>, segments: Se
   if (x.coaching_priorities.length > 3) warnings.push(`the model returned ${x.coaching_priorities.length} coaching priorities; only the first three are kept`);
   return { extras, warnings, errors: f.errors };
 }
-
-/**
- * A confirmed, quote-verified flag caps at 1 every flag-linked criterion whose cited evidence overlaps the flagged segments:
- * manufactured urgency, pressure, fabricated proof, earnings promises, misrepresented support and disregarded refusals are never rewarded.
- */
-export function applyFlagCaps(criteria: Mrv1Criterion[], flags: Extras["flags"], adjustments: Adjustment[]): void {
-  for (const f of flags) {
-    if (f.interpretation !== "confirmed_conduct" || f.verification_status !== "quote_verified") continue;
-    const linked = FLAG_CRITERIA[f.flag_id] ?? [];
-    for (const c of criteria) {
-      if (!linked.includes(c.criterion_id) || !(c.outcome === "2" || c.outcome === "3")) continue;
-      const overlaps = c.evidence.some((e) => f.segments.some((s) => s >= e.segment_start && s <= e.segment_end));
-      if (!overlaps) continue;
-      adjustments.push({ criterion_id: c.criterion_id, from: c.outcome, to: "1", reason: `capped at 1: the cited evidence overlaps a confirmed ${f.flag_id} flag` });
-      c.model_original_outcome = c.model_original_outcome ?? c.outcome;
-      c.outcome = "1";
-      c.score = 1;
-    }
-  }
-}
-

@@ -329,18 +329,6 @@ export const PROSPECT_ANSWER_REQUIRED: string[] = [
   "C06-01", "C06-02", "C07-01", "C07-02", "C08-01", "C09-01", "C09-02", "C09-03", "C10-01", "C12-01", "C12-02", "C12-03", "C17-01", "C17-02", "C11-01",
 ];
 
-/** A confirmed, verified flag caps the score of criteria whose cited evidence overlaps the flagged segments at 1 (never rewarded). */
-export const FLAG_CRITERIA: Record<string, string[]> = {
-  fake_urgency: ["C07-01", "C07-02", "C13-01", "C13-02", "C17-02", "C17-04", "C19-01", "C19-04"],
-  financial_pressure: ["C05-05", "C17-03", "C19-01", "C19-02", "C19-04"],
-  coercive_emotional_pressure: ["C06-01", "C06-02", "C13-01", "C13-02", "C19-04"],
-  fabricated_social_proof: ["C14-01", "C14-02", "C14-03", "C19-02"],
-  false_earnings_promise: ["C14-02", "C15-03", "C19-02", "C19-03"],
-  misrepresented_support: ["C15-04", "C19-03"],
-  misleading_product_claim: ["C15-01", "C15-02", "C15-05", "C17-03", "C11-02"],
-  refusal_not_respected: ["C17-04", "C16-05", "C19-04"],
-};
-
 export function anchorText(id: string): string {
   const a = ANCHORS[id];
   if (!a) return "";

@@ -142,6 +142,9 @@ export interface Adjustment {
   from: Outcome;
   to: Outcome;
   reason: string;
+  /** MRV1.0: what kind of rule changed the outcome, and for flag caps the flags responsible (so a human decision can reverse it). */
+  kind?: "flag_cap" | "prospect_answer_cap" | "evidence" | "element_cap" | "other";
+  flag_refs?: Array<{ flag_id: string; segments: number[] }>;
 }
 export interface TranscriptQuality {
   language: string | null;

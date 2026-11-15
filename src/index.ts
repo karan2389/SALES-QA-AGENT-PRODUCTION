@@ -12,6 +12,18 @@ import { runEvaluation } from "./evaluation/evaluate.ts";
 import { createGptOssModel } from "./evaluation/workers-ai-model.ts";
 import { runMrv1Evaluation } from "./mrv1/engine.ts";
 import { createMrv1Store } from "./mrv1/d1-store.ts";
+import { createD1JobStore } from "./mrv1/jobs/d1-job-store.ts";
+import { cancelJob, createEvaluationJob, getJobStatus, processJobMessage, retryJob } from "./mrv1/jobs/service.ts";
+import type { JobDeps } from "./mrv1/jobs/service.ts";
+import type { JobMessage } from "./mrv1/jobs/types.ts"
+
+function jobDeps(env: Env): JobDeps {
+  return {
+    jobs: createD1JobStore(env.DB),
+    mrv1: { store: createMrv1Store(env.DB), model: createGptOssModel(env.AI) },
+    queue: { send: async (msg, opts) => void (await env.EVAL_QUEUE!.send(msg, opts)) },
+  };
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -152,6 +164,9 @@ export default {
       const auth = request.headers.get("authorization");
       if (!env.ADMIN_TOKEN || auth !== `Bearer ${env.ADMIN_TOKEN}`) return new Response("forbidden", { status: 403 });
       if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+      // The synchronous route runs all four model passes inside one request, which is not demonstrated safe (docs/mrv1-execution-architecture.md).
+      // It is off unless MRV1_ALLOW_SYNC=1 (controlled local use); the production path is the durable job pipeline below.
+      if (env.MRV1_ALLOW_SYNC !== "1") return Response.json({ status: "disabled", error: "the synchronous MRV1 route is disabled; use POST /admin/mrv1/jobs/<callyzer id> (durable queue pipeline)" }, { status: 410 });
       const q = url.searchParams;
       const transcriptSource = q.get("transcript") ?? "production";
       if (!/^(production|experiment:[a-z0-9_]{1,40})$/.test(transcriptSource)) return new Response("bad transcript source", { status: 400 });
@@ -164,6 +179,63 @@ export default {
       return Response.json(result, { status });
     }
 
+    // ---- MRV1.0 durable job pipeline (Cloudflare Queues + D1 job state). Requires the EVAL_QUEUE binding and migration 0007. ----
+    // POST /admin/mrv1/jobs/<callyzer id>?[transcript=..][&acknowledge_conflict=1][&acknowledge_transcript_review=1][&by=..]  create a job (202) or return the existing one
+    // GET  /admin/mrv1/job/<id>                                                                                               status and per-stage progress
+    // POST /admin/mrv1/job/<id>/retry?[acknowledge_conflict=1][&acknowledge_transcript_review=1]                              resume after a failure or a human decision
+    // POST /admin/mrv1/job/<id>/cancel?reason=..                                                                              stop a job
+    const jobRoute = url.pathname.match(/^\/admin\/mrv1\/(jobs\/([A-Za-z0-9_-]+)|job\/(\d+)(?:\/(retry|cancel))?)$/);
+    if (jobRoute) {
+      const auth = request.headers.get("authorization");
+      if (!env.ADMIN_TOKEN || auth !== `Bearer ${env.ADMIN_TOKEN}`) return new Response("forbidden", { status: 403 });
+      if (!env.EVAL_QUEUE) return Response.json({ status: "unavailable", error: "the EVAL_QUEUE binding is not configured" }, { status: 503 });
+      const deps = jobDeps(env);
+      const q = url.searchParams;
+      if (jobRoute[2]) {
+        if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+        const transcriptSource = q.get("transcript") ?? "production";
+        if (!/^(production|experiment:[a-z0-9_]{1,40})$/.test(transcriptSource)) return new Response("bad transcript source", { status: 400 });
+        const r = await createEvaluationJob(deps, { callyzerCallId: jobRoute[2], transcriptSource, acknowledgeConflict: q.get("acknowledge_conflict") === "1", acknowledgeTranscriptReview: q.get("acknowledge_transcript_review") === "1", requestedBy: q.get("by") });
+        if (r.status === "queued") return Response.json({ status: "queued", job_id: r.job.id, prompt_version: r.job.prompt_version }, { status: 202 });
+        if (r.status === "existing_job") return Response.json({ status: "existing_job", job_id: r.job.id, job_status: r.job.status });
+        if (r.status === "enqueue_failed") return Response.json({ status: "enqueue_failed", job_id: r.job.id, error: r.message }, { status: 502 });
+        return Response.json(r.result, { status: r.result.status === "hold" ? 409 : r.result.status === "failed" ? 422 : 200 });
+      }
+      const id = Number(jobRoute[3]);
+      if (!jobRoute[4]) {
+        if (request.method !== "GET") return new Response("method not allowed", { status: 405 });
+        const s = await getJobStatus(deps, id);
+        return s ? Response.json({ job_id: s.job.id, status: s.job.status, summary: s.summary, current_stage: s.job.current_stage, evaluation_id: s.job.evaluation_id, error_code: s.job.last_error_code, retry_eligible: s.job.retry_eligible, stages: s.stages }) : Response.json({ error: "job not found" }, { status: 404 });
+      }
+      if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+      if (jobRoute[4] === "retry") {
+        const r = await retryJob(deps, id, { acknowledgeConflict: q.get("acknowledge_conflict") === "1", acknowledgeTranscriptReview: q.get("acknowledge_transcript_review") === "1" });
+        return r.ok ? Response.json({ status: "requeued", job_id: id }, { status: 202 }) : Response.json({ status: "rejected", error: r.error }, { status: 409 });
+      }
+      const c = await cancelJob(deps, id, q.get("reason") ?? "cancelled by operator");
+      return c.ok ? Response.json({ status: "cancelled", job_id: id }) : Response.json({ status: "rejected", error: c.error }, { status: 409 });
+    }
+
     return Response.json({ service: "sales-qa-agent", status: "ok", phase: 1 });
+  },
+
+  // Queue consumer for MRV1.0 evaluation jobs: one stage per message. Unexpected errors retry with backoff; the stage lease and the stage attempt limit
+  // keep duplicate deliveries and poison messages harmless. Messages the pipeline gives up on are acknowledged (the job row records why).
+  async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
+    const deps = jobDeps(env);
+    for (const m of batch.messages) {
+      try {
+        const body = m.body as Partial<JobMessage> | null;
+        if (!body || body.v !== 1 || !Number.isInteger(body.job_id) || typeof body.stage !== "string") {
+          m.ack(); // malformed message: a poison message is dropped, not retried
+          continue;
+        }
+        const o = await processJobMessage(deps, body as JobMessage);
+        if (o.action === "retry") m.retry({ delaySeconds: o.delaySeconds });
+        else m.ack();
+      } catch {
+        m.retry({ delaySeconds: 60 }); // D1 or queue trouble outside the pipeline s own handling; the platform dead-letter queue catches repeat failures
+      }
+    }
   },
 } satisfies ExportedHandler<Env>;

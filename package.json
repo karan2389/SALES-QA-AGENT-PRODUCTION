@@ -19,15 +19,18 @@
         "label:call": "node scripts/label-call.ts",
         "transcribe:calls": "node scripts/transcribe-calls.ts",
         "test:transcribe": "node --test scripts/transcribe.test.ts",
-        "test:sheets": "node --test scripts/sheets.test.ts scripts/sheets-mrv1.test.ts",
+        "test:sheets": "node --test scripts/sheets.test.ts scripts/sheets-mrv1.test.ts scripts/sheets-store.test.ts",
         "google:check": "node scripts/google-credentials.ts check",
         "google:sync-dev": "node scripts/google-credentials.ts sync-dev",
         "validate:transcripts": "node scripts/validate-transcripts.ts",
         "test:quality": "node --test scripts/transcript-quality.test.ts",
         "test:score": "node --test scripts/score.test.ts",
-        "test:mrv1": "node --test scripts/mrv1.test.ts scripts/mrv1-anchors.test.ts scripts/mrv1-transcript-gate.test.ts scripts/mrv1-validation-metrics.test.ts scripts/mrv1-persistence.test.ts",
+        "test:mrv1": "node --test scripts/mrv1.test.ts scripts/mrv1-anchors.test.ts scripts/mrv1-scoring-audit.test.ts scripts/mrv1-transcript-gate.test.ts scripts/mrv1-validation-metrics.test.ts scripts/mrv1-persistence.test.ts",
         "benchmark:mrv1": "node scripts/benchmark-mrv1.ts",
-        "validation:template": "node scripts/validation-template.ts"
+        "validation:template": "node scripts/validation-template.ts",
+        "test:jobs": "node --test scripts/mrv1-jobs-sql.test.ts",
+        "test:benchmark": "node --test scripts/mrv1-benchmark-harness.test.ts",
+        "benchmark:live": "node scripts/benchmark-mrv1-live.ts"
     },
     "devDependencies": {
         "@cloudflare/workers-types": "^5.20261114.1",

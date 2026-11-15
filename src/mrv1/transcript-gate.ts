@@ -26,6 +26,7 @@ export const GATE = {
   minLastEndRatio: 0.8,
   endToleranceS: 5,
   maxBrokenSegmentRatio: 0.05,
+  maxBrokenCharRatio: 0.005,
   maxRepeatRatio: 0.2,
   reviewRepeatRatio: 0.05,
   maxEmptyRatio: 0.5,
@@ -61,9 +62,17 @@ export function assessTranscript(raw: RawSegment[], audioSeconds: number, langua
   metrics.speech_pct = q.speech_pct;
   metrics.largest_gap_s = q.largest_gaps[0]?.length_s ?? 0;
   if (clean.length > 0 && q.out_of_order >= 3 && q.out_of_order / clean.length > 0.02) add("out_of_order_segments", "block", `${q.out_of_order} segments start before the previous one`);
-  const broken = clean.filter((s) => s.text.includes("�")).length;
+  const broken = clean.filter((s) => s.text.includes("\uFFFD")).length;
+  const brokenChars = clean.reduce((n, s) => n + (s.text.match(/\uFFFD/g)?.length ?? 0), 0);
+  const totalChars = clean.reduce((n, s) => n + s.text.length, 0);
+  const brokenCharRatio = totalChars > 0 ? brokenChars / totalChars : 0;
   metrics.broken_segments = broken;
-  if (clean.length > 0 && broken / clean.length > GATE.maxBrokenSegmentRatio) add("broken_encoding", "block", `${broken} of ${clean.length} segments contain replacement characters`);
+  metrics.broken_chars = brokenChars;
+  metrics.broken_char_ratio = Math.round(brokenCharRatio * 100000) / 100000;
+  // Segment count alone misleads when segments are long (one stray character taints a whole 20 s segment), so a block needs BOTH many tainted
+  // segments and a meaningful share of broken characters. Many tainted segments with few broken characters go to a human instead.
+  if (clean.length > 0 && broken / clean.length > GATE.maxBrokenSegmentRatio && brokenCharRatio > GATE.maxBrokenCharRatio) add("broken_encoding", "block", `${broken} of ${clean.length} segments contain replacement characters (${brokenChars} broken characters, ${(brokenCharRatio * 100).toFixed(2)}% of the text)`);
+  else if (clean.length > 0 && broken / clean.length > GATE.maxBrokenSegmentRatio) add("broken_encoding_long_segments", "review", `${broken} of ${clean.length} segments contain replacement characters but only ${brokenChars} characters (${(brokenCharRatio * 100).toFixed(2)}% of the text) are broken: a human should check the affected words`);
   else if (broken > 0) add("broken_encoding_minor", "note", `${broken} segment(s) contain replacement characters; affected criteria may be NE`);
   const repRatio = clean.length ? q.repeated_segments / clean.length : 0;
   metrics.repeated_ratio = Math.round(repRatio * 1000) / 1000;
