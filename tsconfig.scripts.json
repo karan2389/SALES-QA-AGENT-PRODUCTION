@@ -1,0 +1,6 @@
+﻿{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["node"], "lib": ["ES2022", "DOM"] },
+  "include": ["scripts/**/*.ts", "src/callyzer/**/*.ts", "src/evaluation/**/*.ts", "src/transcribe.ts", "src/transcript-quality.ts", "src/sheets/**/*.ts", "src/mrv1/**/*.ts"],
+  "exclude": ["src/evaluation/d1-store.ts", "src/evaluation/workers-ai-model.ts", "src/sheets/d1-export-store.ts", "src/mrv1/d1-store.ts", "scripts/mrv1-persistence.test.ts"]
+}

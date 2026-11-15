@@ -1,0 +1,39 @@
+{
+    "name": "sales-qa-agent-production",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "description": "FlexiFunnels Sales Call Quality Analysis Agent (Phase 1)",
+    "scripts": {
+        "dev": "wrangler dev",
+        "deploy": "wrangler deploy",
+        "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.scripts.json",
+        "test:callyzer": "node --test scripts/callyzer-client.test.ts",
+        "diagnose:callyzer": "node --env-file=.env scripts/callyzer-diagnose.ts",
+        "select:agents": "node --env-file=.env scripts/select-agents.ts",
+        "store:recordings": "node --env-file=.env scripts/store-recordings.ts",
+        "seed:calls": "node --env-file=.env scripts/seed-calls.ts",
+        "test:evaluation": "node --test scripts/evaluation.test.ts",
+        "check:rubric": "node scripts/check-rubric.ts",
+        "evaluate:call": "node scripts/evaluate-call.ts",
+        "label:call": "node scripts/label-call.ts",
+        "transcribe:calls": "node scripts/transcribe-calls.ts",
+        "test:transcribe": "node --test scripts/transcribe.test.ts",
+        "test:sheets": "node --test scripts/sheets.test.ts scripts/sheets-mrv1.test.ts",
+        "google:check": "node scripts/google-credentials.ts check",
+        "google:sync-dev": "node scripts/google-credentials.ts sync-dev",
+        "validate:transcripts": "node scripts/validate-transcripts.ts",
+        "test:quality": "node --test scripts/transcript-quality.test.ts",
+        "test:score": "node --test scripts/score.test.ts",
+        "test:mrv1": "node --test scripts/mrv1.test.ts scripts/mrv1-anchors.test.ts scripts/mrv1-transcript-gate.test.ts scripts/mrv1-validation-metrics.test.ts scripts/mrv1-persistence.test.ts",
+        "benchmark:mrv1": "node scripts/benchmark-mrv1.ts",
+        "validation:template": "node scripts/validation-template.ts"
+    },
+    "devDependencies": {
+        "@cloudflare/workers-types": "^5.20261114.1",
+        "@types/node": "^26.6.6",
+        "mpg123-decoder": "^1.0.3",
+        "typescript": "^7.0.2",
+        "wrangler": "^4.162.0"
+    }
+}

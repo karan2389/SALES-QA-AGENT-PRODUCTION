@@ -1,0 +1,39 @@
+﻿{
+  // Phase 1 config. Resource names/IDs are the real Cloudflare resources.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sales-qa-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-11-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "observability": { "enabled": true },
+
+  // Workers AI (Whisper transcription + evaluation LLM)
+  "ai": { "binding": "AI" },
+
+  // D1 database (remote: true => `wrangler dev` uses the real database, not a local copy).
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "flexifunnels-call-intelligence",
+      "database_id": "f13332d4-7ba4-4b5c-81fc-7e8991b84397",
+      "migrations_dir": "migrations",
+      "remote": true
+    }
+  ],
+
+  // Private R2 bucket for call recordings.
+  "r2_buckets": [
+    {
+      "binding": "RECORDINGS",
+      "bucket_name": "sales-call-recordings",
+      "remote": true
+    }
+  ]
+
+  // Secrets (Callyzer token, Google service account, etc.) are NOT stored here.
+  // Local: .dev.vars (gitignored). Deployed: `wrangler secret put <NAME>`.
+}
+
+
+
